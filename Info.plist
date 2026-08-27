@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>NoSleepBar</string>
+	<key>CFBundleDisplayName</key>
+	<string>NoSleepBar</string>
+	<key>CFBundleIdentifier</key>
+	<string>kr.co.inxight.nosleepbar</string>
+	<key>CFBundleExecutable</key>
+	<string>NoSleepBar</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- 메뉴바 전용 앱 — Dock 아이콘과 앱 전환기에 나타나지 않는다 -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>내부 사용 유틸리티</string>
+</dict>
+</plist>
