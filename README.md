@@ -1,9 +1,6 @@
 # NoSleepBar
 
-덮개를 닫아도 맥북이 잠들지 않게 하는 macOS 메뉴바 토글.
-
-외부 디스플레이도, 전원 어댑터도 필요 없다. macOS 기본 clamshell 모드와 달리
-배터리로만 돌아가는 상태에서도 덮개를 닫은 채 작업을 계속 돌릴 수 있다.
+화면 자동 꺼짐과 덮개를 닫을 때의 잠자기를 함께 차단하는 macOS 메뉴바 토글.
 
 Swift 한 파일(`main.swift`)과 셸 스크립트 몇 개가 전부다. Xcode 프로젝트는 없다.
 
@@ -11,11 +8,18 @@ Swift 한 파일(`main.swift`)과 셸 스크립트 몇 개가 전부다. Xcode �
 
 ## 동작 원리
 
-`pmset -a disablesleep 1` 이 커널의 `IOPMrootDomain` 속성 `SleepDisabled` 를 켠다.
-이 값이 `Yes` 면 덮개를 닫아 clamshell 이벤트가 발생해도 커널이 잠자기를 거부한다.
+토글을 켜면 서로 다른 두 계층을 함께 적용한다.
 
-메뉴바 아이콘과 메뉴는 앱 내부 변수가 아니라 **매번 IORegistry 의 실제 값을 읽어서** 그린다.
-터미널에서 `pmset` 을 직접 쳐서 값을 바꿔도 메뉴바가 진실을 보여준다.
+1. 사용자 LaunchAgent가 `/usr/bin/caffeinate -dimsu` 를 계속 실행한다. 화면 자동 꺼짐,
+   유휴 시스템 잠자기, 디스크 유휴 상태 등을 `caffeinate` 와 같은 방식으로 차단한다.
+2. `pmset -a disablesleep 1` 로 `IOPMrootDomain` 의 `SleepDisabled` 를 켜 덮개 닫힘
+   잠자기를 별도로 차단한다. 이 설정은 관리자 권한이 필요하다.
+
+앱을 종료해도 설정을 유지하도록 선택한 경우 `caffeinate` LaunchAgent와 `SleepDisabled`가
+모두 남는다. LaunchAgent는 프로세스가 예기치 않게 종료되면 다시 실행한다.
+
+메뉴는 `caffeinate` 프로세스와 `SleepDisabled`의 실제 상태를 각각 표시한다. 두 항목이
+모두 켜져 있을 때만 전체 상태를 **켜짐**으로 표시한다.
 
 ---
 
@@ -39,7 +43,7 @@ sudo ./install-sudoers.sh   # (선택) 비밀번호 프롬프트 없애기
 open -a ~/Applications/NoSleepBar.app
 ```
 
-`build.sh` 는 기존에 떠 있던 NoSleepBar 를 종료하고 번들을 다시 만든다.
+`build.sh` 는 임시 위치에서 새 번들의 컴파일·서명 검증을 마친 뒤 기존 NoSleepBar를 교체한다.
 
 ### sudoers 항목은 왜 선택인가
 
@@ -59,7 +63,7 @@ open -a ~/Applications/NoSleepBar.app
 ```
 
 스크립트는 `visudo -c` 로 문법을 먼저 검증한 뒤에만 `/etc/sudoers.d/nosleepbar` 에 설치하고,
-설치 후 대상 사용자로 실제 무암호 실행이 되는지까지 확인한다.
+설치 후 대상 사용자의 켜기·끄기 명령이 무암호로 허용되는지 설정값 변경 없이 확인한다.
 
 되돌리기: `sudo rm /etc/sudoers.d/nosleepbar`
 
@@ -69,8 +73,8 @@ open -a ~/Applications/NoSleepBar.app
 
 | 항목 | 설명 |
 |---|---|
-| 상태 헤더 | 켜짐/꺼짐, 전원 연결 여부와 배터리 잔량 |
-| 켜기 / 끄기 (`⌘T`) | 토글 |
+| 상태 헤더 | 전체 상태와 화면 자동 꺼짐 차단/덮개 닫힘 차단의 개별 상태 |
+| 켜기 / 끄기 (`⌘T`) | 두 차단 기능을 함께 켜거나 끈다 |
 | 자동 해제 | 사용 안 함 / 30분 / 1시간 / 2시간 / 4시간 뒤 자동으로 끈다 |
 | 배터리 N% 이하면 자동 해제 | 기본 켜짐 |
 | 기준 배터리 | 10 / 15 / 20 / 30 / 50% (기본 20%) |
@@ -78,8 +82,8 @@ open -a ~/Applications/NoSleepBar.app
 | 로그인할 때 자동 실행 | LaunchAgent 등록/해제 |
 | NoSleepBar 종료 (`⌘Q`) | |
 
-아이콘은 꺼졌을 때 `zzz` 템플릿 심볼, 켜졌을 때 오렌지색 `eye.fill` 이다.
-켜진 상태는 배터리를 계속 먹으므로 눈에 띄게 만들어 뒀다.
+아이콘은 꺼졌을 때 `zzz`, 완전히 켜졌을 때 오렌지색 `eye.fill`, 두 기능 중 하나만
+켜진 비정상 상태일 때 빨간색 경고 삼각형이다.
 
 ### 배터리 보호
 
@@ -96,6 +100,10 @@ open -a ~/Applications/NoSleepBar.app
 
 `~/Library/LaunchAgents/kr.co.inxight.nosleepbar.plist` 를 만들고 `launchctl bootstrap` 한다.
 끄면 `bootout` 후 파일을 지운다.
+
+화면 자동 꺼짐 차단 프로세스는 별도
+`~/Library/LaunchAgents/kr.co.inxight.nosleepbar.caffeinate.plist` 로 관리한다. 이 파일은
+전체 차단 기능을 끄거나, `종료할 때 자동 해제`가 켜진 상태로 앱을 종료하면 제거된다.
 
 ---
 
@@ -137,14 +145,17 @@ open -a ~/Applications/NoSleepBar.app
 ./uninstall.sh
 ```
 
-잠자기 차단 해제 → 앱 종료 → LaunchAgent 제거 → 번들 삭제 → `defaults` 설정값 삭제 →
-sudoers 항목 삭제 → `visudo -c` 재검증 순으로 돈다. 소스는 그대로 남는다.
+잠자기 차단 해제 → 앱 종료 → `caffeinate` 및 로그인 LaunchAgent 제거 → 번들 삭제 →
+`defaults` 설정값 삭제 → sudoers 항목 삭제 → `visudo -c` 재검증 순으로 돈다.
 
 ---
 
 ## 확인된 범위
 
-`main.swift` 주석 기준 — M1 / macOS 26.5.2 에서 `SleepDisabled` 값이 0 → 1 로 바뀌고
-`ioreg` 에 반영되는 것까지 실측했다.
+`caffeinate` 실행 여부는 `launchctl print`로, 덮개 차단은 IORegistry의 `SleepDisabled`로
+각각 확인한다. `caffeinate -s` assertion은 macOS 자체 동작에 따라 전원 연결 중에만 유효하다.
 
-Intel 맥, 다른 macOS 버전, 장시간 덮개 유지 동작은 확인하지 않았다.
+`pmset disablesleep`은 `pmset(1)` 매뉴얼에 공개된 설정이 아니다. macOS 또는 기기 모델에
+따라 덮개 닫힘 동작이 달라질 수 있으므로 실제 기기에서 덮개를 닫은 동안 로그가 계속
+기록되는지 확인해야 한다. 로컬 `lid-test.sh`는 CPU가 계속 실행됐는지만 확인하며,
+특정 SSH·VPN·원격 제어 연결의 지속 여부까지 검증하지는 않는다.

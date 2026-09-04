@@ -11,9 +11,26 @@
 # 5초마다 한 줄씩 찍는다. 덮개를 닫은 동안 줄이 계속 늘어났으면 성공,
 # 시각이 뚝 끊겼다가 다시 이어지면 그 구간에 잠든 것이다.
 
-LOG="$HOME/nosleep-test.log"
+set -euo pipefail
 
-echo "잠자기 차단 상태: $(pmset -g | grep -i sleepdisabled | awk '{print $2}')  (1이어야 한다)"
+LOG="$HOME/nosleep-test.log"
+CAFFEINATE_LABEL="kr.co.inxight.nosleepbar.caffeinate"
+CAFFEINATE_TARGET="gui/$(id -u)/$CAFFEINATE_LABEL"
+
+SLEEP_DISABLED="$(pmset -g | awk 'tolower($1) == "sleepdisabled" { print $2; exit }')"
+if [ "$SLEEP_DISABLED" != "1" ]; then
+  echo "덮개 닫힘 잠자기 차단: 꺼짐 — 메뉴바에서 차단을 다시 켜야 합니다." >&2
+  exit 1
+fi
+echo "덮개 닫힘 잠자기 차단: 켜짐  (SleepDisabled 1)"
+
+if ! AGENT_INFO="$(launchctl print "$CAFFEINATE_TARGET" 2>/dev/null)" \
+  || ! grep -q 'state = running' <<< "$AGENT_INFO" \
+  || ! grep -q -- '-dimsu' <<< "$AGENT_INFO"; then
+  echo "화면 자동 꺼짐 차단: 꺼짐 — 메뉴바에서 차단을 다시 켜야 합니다." >&2
+  exit 1
+fi
+echo "화면 자동 꺼짐 차단: 켜짐  (caffeinate -dimsu)"
 echo "로그 파일: $LOG"
 echo "5초마다 기록합니다. Ctrl+C 로 종료."
 echo "----- 시작 $(date '+%Y-%m-%d %H:%M:%S') -----" >> "$LOG"

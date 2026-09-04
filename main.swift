@@ -1,14 +1,11 @@
-// NoSleepBar — 덮개를 닫아도 맥북이 잠들지 않게 하는 메뉴바 토글
+// NoSleepBar — 화면 자동 꺼짐과 덮개 닫힘 잠자기를 함께 차단하는 메뉴바 토글
 //
 // 동작 원리
-//   pmset -a disablesleep 1/0 이 IOPMrootDomain 의 SleepDisabled 속성을 켜고 끈다.
-//   이 값이 Yes 이면 덮개를 닫아 clamshell 이벤트가 발생해도 커널이 잠자기를 거부한다.
-//   macOS 기본 clamshell 모드와 달리 외부 디스플레이도 전원 어댑터도 필요 없다.
+//   1) 사용자 LaunchAgent 로 /usr/bin/caffeinate -dimsu 를 계속 실행해 화면 및 유휴 잠자기를 막는다.
+//   2) pmset -a disablesleep 1/0 으로 IOPMrootDomain 의 SleepDisabled 속성을 켜고 꺼
+//      덮개를 닫을 때 발생하는 잠자기를 별도로 막는다.
 //
-//   (M1 / macOS 26.5.2 에서 실측 확인: SleepDisabled 0 → 1, ioreg 반영됨)
-//
-// 상태 표시는 앱 내부 변수가 아니라 매번 IORegistry 의 실제 값을 읽어서 그린다.
-// 터미널 등 다른 경로로 값이 바뀌어도 메뉴바가 진실을 보여주게 하기 위해서다.
+// 두 계층이 모두 실제로 켜져 있을 때만 메뉴바에 "켜짐"으로 표시한다.
 
 import Cocoa
 import IOKit
@@ -61,12 +58,36 @@ enum ApplyResult {
     case failed(String)
 }
 
-/// sudoers NOPASSWD 가 깔려 있으면 프롬프트 없이, 아니면 관리자 인증 창으로 폴백한다.
-@discardableResult
-func applySleepDisabled(_ want: Bool) -> ApplyResult {
-    let arg = want ? "1" : "0"
+struct CommandResult {
+    let status: Int32
+    let output: String
+}
 
-    // 1) 무암호 경로
+@discardableResult
+func runCommand(_ executable: String, _ arguments: [String]) -> CommandResult? {
+    let task = Process()
+    let output = Pipe()
+    task.executableURL = URL(fileURLWithPath: executable)
+    task.arguments = arguments
+    task.standardOutput = output
+    task.standardError = output
+
+    do {
+        try task.run()
+        // 프로세스가 쓰는 동안 함께 읽어 pipe 버퍼가 차서 멈추는 일을 피한다.
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return CommandResult(
+            status: task.terminationStatus,
+            output: String(data: data, encoding: .utf8) ?? ""
+        )
+    } catch {
+        return nil
+    }
+}
+
+func applySleepDisabledWithoutPrompt(_ want: Bool) -> Bool {
+    let arg = want ? "1" : "0"
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
     task.arguments = ["-n", "/usr/bin/pmset", "-a", "disablesleep", arg]
@@ -74,8 +95,18 @@ func applySleepDisabled(_ want: Bool) -> ApplyResult {
     task.standardError = Pipe()
     if (try? task.run()) != nil {
         task.waitUntilExit()
-        if task.terminationStatus == 0, readSleepDisabled() == want { return .ok }
+        return task.terminationStatus == 0 && readSleepDisabled() == want
     }
+    return false
+}
+
+/// sudoers NOPASSWD 가 깔려 있으면 프롬프트 없이, 아니면 관리자 인증 창으로 폴백한다.
+@discardableResult
+func applySleepDisabled(_ want: Bool) -> ApplyResult {
+    let arg = want ? "1" : "0"
+
+    // 1) 무암호 경로
+    if applySleepDisabledWithoutPrompt(want) { return .ok }
 
     // 2) 관리자 인증 폴백
     var errorInfo: NSDictionary?
@@ -98,9 +129,20 @@ enum Key {
     static let batteryGuard = "batteryGuard"
     static let batteryThreshold = "batteryThreshold"
     static let releaseOnQuit = "releaseOnQuit"
+    static let protectionEnabled = "protectionEnabled"
 }
 
 let launchAgentLabel = "kr.co.inxight.nosleepbar"
+let caffeinateAgentLabel = "kr.co.inxight.nosleepbar.caffeinate"
+
+struct ProtectionState {
+    let screenStateKnown: Bool
+    let screenSleepBlocked: Bool
+    let lidSleepBlocked: Bool
+
+    var isFullyEnabled: Bool { screenStateKnown && screenSleepBlocked && lidSleepBlocked }
+    var isFullyDisabled: Bool { screenStateKnown && !screenSleepBlocked && !lidSleepBlocked }
+}
 
 // MARK: - 앱
 
@@ -112,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var autoOffTimer: Timer?
     private var autoOffDeadline: Date?
     private var watchdog: Timer?
+    private var lastCaffeinateRecoveryError: String?
 
     private var defaults: UserDefaults { .standard }
 
@@ -122,56 +165,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Key.releaseOnQuit: true,
         ])
 
+        // 기존 버전에는 이 설정 키가 없었다. 당시 실제 커널 상태를 한 번만 가져와
+        // 기존 사용자의 켜짐 상태를 그대로 마이그레이션한다.
+        if defaults.object(forKey: Key.protectionEnabled) == nil {
+            defaults.set(
+                readSleepDisabled() || readProtectionState().screenSleepBlocked,
+                forKey: Key.protectionEnabled
+            )
+        }
+
         menu.delegate = self
         statusItem.menu = menu
+
+        if defaults.bool(forKey: Key.protectionEnabled) {
+            if case .failed(let message) = applyProtection(true) {
+                notify(title: "절전 차단을 완전히 켜지 못했습니다", body: message)
+            }
+        } else if isCaffeinateAgentConfigured() {
+            // 비정상 종료 중 남은 helper 가 있으면 저장된 꺼짐 상태에 맞춘다.
+            _ = stopCaffeinateAgent()
+        }
         refreshIcon()
 
-        // 30초마다 배터리 확인 + 아이콘 갱신(외부 변경 반영)
+        // 30초마다 helper 상태 복구 + 배터리 확인 + 아이콘 갱신
         watchdog = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.tick()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        guard defaults.bool(forKey: Key.releaseOnQuit), readSleepDisabled() else { return }
-        applySleepDisabled(false)
+        guard defaults.bool(forKey: Key.releaseOnQuit) else { return }
+        // 종료 시에는 한 계층의 해제가 실패해도 다른 계층까지 반드시 해제를 시도한다.
+        if readSleepDisabled() { _ = applySleepDisabled(false) }
+        _ = stopCaffeinateAgent()
+        if readProtectionState().isFullyDisabled {
+            defaults.set(false, forKey: Key.protectionEnabled)
+        }
     }
 
     // MARK: 아이콘
 
     private func refreshIcon() {
-        let on = readSleepDisabled()
-        let name = on ? "eye.fill" : "zzz"
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: on ? "잠자기 차단 켜짐" : "잠자기 차단 꺼짐")
+        let state = readProtectionState()
+        let name: String
+        let description: String
+        let color: NSColor?
 
-        if on {
-            // 켜진 상태는 배터리를 계속 먹으므로 눈에 띄어야 한다
+        if state.isFullyEnabled {
+            name = "eye.fill"
+            description = "화면 자동 꺼짐 및 덮개 잠자기 차단 켜짐"
+            color = .systemOrange
+        } else if state.isFullyDisabled {
+            name = "zzz"
+            description = "화면 자동 꺼짐 및 덮개 잠자기 차단 꺼짐"
+            color = nil
+        } else {
+            name = "exclamationmark.triangle.fill"
+            description = "잠자기 차단 일부만 켜짐"
+            color = .systemRed
+        }
+
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: description)
+        if let color {
             image?.isTemplate = false
             statusItem.button?.image = image?.withSymbolConfiguration(
-                NSImage.SymbolConfiguration(paletteColors: [.systemOrange])
+                NSImage.SymbolConfiguration(paletteColors: [color])
             )
         } else {
             image?.isTemplate = true
             statusItem.button?.image = image
         }
-        statusItem.button?.toolTip = on
-            ? "잠자기 차단 켜짐 — 덮개를 닫아도 계속 돌아갑니다"
-            : "잠자기 차단 꺼짐"
+        statusItem.button?.toolTip = description
     }
 
     private func tick() {
         defer { refreshIcon() }
-        guard readSleepDisabled(), defaults.bool(forKey: Key.batteryGuard) else { return }
+
+        let wanted = defaults.bool(forKey: Key.protectionEnabled)
+        let state = readProtectionState()
+
+        // launchd 자체 KeepAlive 에 더해 두 계층의 부분 상태를 비대화식으로 복구한다.
+        if wanted {
+            if !state.lidSleepBlocked {
+                _ = applySleepDisabledWithoutPrompt(true)
+            }
+            if !state.screenSleepBlocked {
+                switch startCaffeinateAgent() {
+                case .ok:
+                    lastCaffeinateRecoveryError = nil
+                case .failed(let message):
+                    if lastCaffeinateRecoveryError != message {
+                        lastCaffeinateRecoveryError = message
+                        notify(title: "화면 자동 꺼짐 차단을 복구하지 못했습니다", body: message)
+                    }
+                }
+            }
+        } else {
+            if state.lidSleepBlocked {
+                _ = applySleepDisabledWithoutPrompt(false)
+            }
+            if state.screenSleepBlocked || isCaffeinateAgentConfigured() {
+                _ = stopCaffeinateAgent()
+            }
+        }
+
+        guard wanted, defaults.bool(forKey: Key.batteryGuard) else { return }
 
         let power = readPower()
         let threshold = defaults.integer(forKey: Key.batteryThreshold)
         guard !power.onAC, power.percent >= 0, power.percent <= threshold else { return }
 
-        turnOff()
-        notify(
-            title: "잠자기 차단을 자동 해제했습니다",
-            body: "배터리가 \(power.percent)% 로 떨어져 설정한 기준(\(threshold)%) 이하가 되었습니다."
-        )
+        if turnOff() {
+            notify(
+                title: "잠자기 차단을 자동 해제했습니다",
+                body: "배터리가 \(power.percent)% 로 떨어져 설정한 기준(\(threshold)%) 이하가 되었습니다."
+            )
+        }
     }
 
     // MARK: 메뉴
@@ -181,19 +290,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuild() {
         menu.removeAllItems()
 
-        let on = readSleepDisabled()
+        let state = readProtectionState()
+        let wanted = defaults.bool(forKey: Key.protectionEnabled)
         let power = readPower()
 
         // 상태 헤더
-        let header = NSMenuItem(title: on ? "잠자기 차단 — 켜짐" : "잠자기 차단 — 꺼짐", action: nil, keyEquivalent: "")
+        let stateTitle: String
+        if state.isFullyEnabled {
+            stateTitle = "잠자기 차단 — 켜짐"
+        } else if state.isFullyDisabled {
+            stateTitle = "잠자기 차단 — 꺼짐"
+        } else {
+            stateTitle = "잠자기 차단 — 일부만 켜짐"
+        }
+        let header = NSMenuItem(title: stateTitle, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
-        let sub = NSMenuItem(title: "  \(power.label)", action: nil, keyEquivalent: "")
-        sub.isEnabled = false
-        menu.addItem(sub)
+        addStatusLine(
+            "화면 자동 꺼짐 차단",
+            isOn: state.screenSleepBlocked,
+            isKnown: state.screenStateKnown
+        )
+        addStatusLine("덮개 닫힘 잠자기 차단", isOn: state.lidSleepBlocked)
 
-        if on, let deadline = autoOffDeadline {
+        let powerItem = NSMenuItem(title: "  \(power.label)", action: nil, keyEquivalent: "")
+        powerItem.isEnabled = false
+        menu.addItem(powerItem)
+
+        if wanted, let deadline = autoOffDeadline {
             let left = max(0, Int(deadline.timeIntervalSinceNow / 60))
             let t = NSMenuItem(title: "  \(left)분 후 자동 해제", action: nil, keyEquivalent: "")
             t.isEnabled = false
@@ -202,7 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        add(on ? "끄기" : "켜기", #selector(toggle), key: "t")
+        add(wanted ? "끄기" : "켜기", #selector(toggle), key: "t")
 
         menu.addItem(.separator())
 
@@ -253,6 +378,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("NoSleepBar 종료", #selector(quit), key: "q")
     }
 
+    private func addStatusLine(_ title: String, isOn: Bool, isKnown: Bool = true) {
+        let status = isKnown ? (isOn ? "켜짐" : "꺼짐") : "확인 실패"
+        let item = NSMenuItem(
+            title: "  \(title) · \(status)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        item.isEnabled = false
+        menu.addItem(item)
+    }
+
     @discardableResult
     private func add(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
@@ -264,20 +400,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: 동작
 
     @objc private func toggle() {
-        let want = !readSleepDisabled()
-        switch applySleepDisabled(want) {
+        let want = !defaults.bool(forKey: Key.protectionEnabled)
+        switch applyProtection(want) {
         case .ok:
+            defaults.set(want, forKey: Key.protectionEnabled)
             if !want { clearAutoOff() }
             refreshIcon()
         case .failed(let message):
             refreshIcon()
-            notify(title: "설정을 바꾸지 못했습니다", body: message)
+            notify(title: "절전 차단 설정을 바꾸지 못했습니다", body: message)
         }
     }
 
-    private func turnOff() {
-        if case .ok = applySleepDisabled(false) { clearAutoOff() }
-        refreshIcon()
+    @discardableResult
+    private func turnOff() -> Bool {
+        switch applyProtection(false) {
+        case .ok:
+            defaults.set(false, forKey: Key.protectionEnabled)
+            clearAutoOff()
+            refreshIcon()
+            return true
+        case .failed(let message):
+            refreshIcon()
+            notify(title: "잠자기 차단을 해제하지 못했습니다", body: message)
+            return false
+        }
     }
 
     @objc private func setAutoOff(_ sender: NSMenuItem) {
@@ -285,10 +432,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let minutes = sender.tag
         guard minutes > 0 else { return }
 
-        // 타이머를 걸면 잠자기 차단도 함께 켠다
-        if !readSleepDisabled() {
-            guard case .ok = applySleepDisabled(true) else {
-                notify(title: "설정을 바꾸지 못했습니다", body: "잠자기 차단을 켜지 못해 타이머를 걸지 않았습니다.")
+        // 타이머를 걸면 두 절전 차단 기능도 함께 켠다.
+        if !defaults.bool(forKey: Key.protectionEnabled) || !readProtectionState().isFullyEnabled {
+            switch applyProtection(true) {
+            case .ok:
+                defaults.set(true, forKey: Key.protectionEnabled)
+            case .failed(let message):
+                notify(title: "설정을 바꾸지 못했습니다", body: "잠자기 차단을 켜지 못했습니다. \(message)")
                 refreshIcon()
                 return
             }
@@ -314,6 +464,279 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func setThreshold(_ sender: NSMenuItem) {
         defaults.set(sender.tag, forKey: Key.batteryThreshold)
+    }
+
+    // MARK: 화면 자동 꺼짐·덮개 절전 차단
+
+    private var caffeinateAgentURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(caffeinateAgentLabel).plist")
+    }
+
+    private var caffeinateServiceTarget: String {
+        "gui/\(getuid())/\(caffeinateAgentLabel)"
+    }
+
+    private struct CaffeinateAgentStatus {
+        let isKnown: Bool
+        let loaded: Bool
+        let running: Bool
+        let commandMatches: Bool
+        let error: String
+    }
+
+    private func caffeinateAgentStatus() -> CaffeinateAgentStatus {
+        guard let result = runCommand("/bin/launchctl", ["print", caffeinateServiceTarget]) else {
+            return CaffeinateAgentStatus(
+                isKnown: false,
+                loaded: false,
+                running: false,
+                commandMatches: false,
+                error: "launchctl 을 실행하지 못했습니다."
+            )
+        }
+
+        if result.status == 0 {
+            return CaffeinateAgentStatus(
+                isKnown: true,
+                loaded: true,
+                running: result.output.contains("state = running"),
+                commandMatches: result.output.contains("/usr/bin/caffeinate")
+                    && result.output.contains("-dimsu"),
+                error: ""
+            )
+        }
+
+        let notFound = result.output.contains("Could not find service")
+        return CaffeinateAgentStatus(
+            isKnown: notFound,
+            loaded: false,
+            running: false,
+            commandMatches: false,
+            error: result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    private func isCaffeinateAgentConfigured() -> Bool {
+        if FileManager.default.fileExists(atPath: caffeinateAgentURL.path) { return true }
+        let status = caffeinateAgentStatus()
+        return status.isKnown && status.loaded
+    }
+
+    private func readProtectionState() -> ProtectionState {
+        let status = caffeinateAgentStatus()
+        return ProtectionState(
+            screenStateKnown: status.isKnown,
+            screenSleepBlocked: status.running && status.commandMatches,
+            lidSleepBlocked: readSleepDisabled()
+        )
+    }
+
+    private func commandError(_ result: CommandResult?, fallback: String) -> String {
+        guard let result else { return fallback }
+        let message = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? fallback : message
+    }
+
+    /// 앱이 종료되어도 설정을 유지할 수 있도록 caffeinate 를 별도 사용자 LaunchAgent 로 관리한다.
+    private func startCaffeinateAgent() -> ApplyResult {
+        let fm = FileManager.default
+        let url = caffeinateAgentURL
+        let plist: [String: Any] = [
+            "Label": caffeinateAgentLabel,
+            "ProgramArguments": ["/usr/bin/caffeinate", "-dimsu"],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ThrottleInterval": 3,
+            "StandardOutPath": "/dev/null",
+            "StandardErrorPath": "/dev/null",
+        ]
+
+        let initialStatus = caffeinateAgentStatus()
+        guard initialStatus.isKnown else {
+            return .failed(initialStatus.error.isEmpty
+                ? "caffeinate 상태를 확인하지 못했습니다."
+                : initialStatus.error)
+        }
+
+        do {
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: plist,
+                format: .xml,
+                options: 0
+            )
+            try data.write(to: url, options: .atomic)
+        } catch {
+            return .failed("caffeinate 실행 설정을 저장하지 못했습니다: \(error.localizedDescription)")
+        }
+
+        var status = caffeinateAgentStatus()
+        if status.loaded, !status.commandMatches {
+            let result = runCommand("/bin/launchctl", ["bootout", caffeinateServiceTarget])
+            guard result?.status == 0 else {
+                return .failed(commandError(result, fallback: "기존 caffeinate 설정을 교체하지 못했습니다."))
+            }
+            status = caffeinateAgentStatus()
+            guard status.isKnown, !status.loaded else {
+                return .failed("기존 caffeinate 설정이 종료됐는지 확인하지 못했습니다.")
+            }
+        }
+
+        if !status.running {
+            let result: CommandResult?
+            if status.loaded {
+                result = runCommand("/bin/launchctl", ["kickstart", "-k", caffeinateServiceTarget])
+            } else {
+                result = runCommand(
+                    "/bin/launchctl",
+                    ["bootstrap", "gui/\(getuid())", url.path]
+                )
+            }
+
+            guard result?.status == 0 else {
+                let message = commandError(result, fallback: "caffeinate 를 시작하지 못했습니다.")
+                _ = stopCaffeinateAgent()
+                return .failed(message)
+            }
+
+            // launchctl 명령 직후 실제 프로세스가 running 상태가 될 때까지 짧게 확인한다.
+            for _ in 0..<10 {
+                status = caffeinateAgentStatus()
+                if status.running, status.commandMatches { return .ok }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+
+        if status.running, status.commandMatches { return .ok }
+        _ = stopCaffeinateAgent()
+        return .failed("caffeinate 실행 요청은 성공했지만 프로세스가 시작되지 않았습니다.")
+    }
+
+    private func stopCaffeinateAgent() -> ApplyResult {
+        let fm = FileManager.default
+        let url = caffeinateAgentURL
+        let status = caffeinateAgentStatus()
+
+        guard status.isKnown else {
+            return .failed(status.error.isEmpty
+                ? "caffeinate 상태를 확인하지 못했습니다."
+                : status.error)
+        }
+
+        if status.loaded {
+            let result = runCommand("/bin/launchctl", ["bootout", caffeinateServiceTarget])
+            let afterBootout = caffeinateAgentStatus()
+            guard afterBootout.isKnown else {
+                return .failed(afterBootout.error.isEmpty
+                    ? "caffeinate 종료 상태를 확인하지 못했습니다."
+                    : afterBootout.error)
+            }
+            if result?.status != 0, afterBootout.loaded {
+                return .failed(commandError(result, fallback: "caffeinate 를 종료하지 못했습니다."))
+            }
+            if afterBootout.loaded {
+                return .failed("caffeinate 서비스가 종료되지 않았습니다.")
+            }
+        }
+
+        if fm.fileExists(atPath: url.path) {
+            do {
+                try fm.removeItem(at: url)
+            } catch {
+                return .failed("caffeinate 실행 설정을 지우지 못했습니다: \(error.localizedDescription)")
+            }
+        }
+
+        let finalStatus = caffeinateAgentStatus()
+        guard finalStatus.isKnown else {
+            return .failed(finalStatus.error.isEmpty
+                ? "caffeinate 종료 상태를 확인하지 못했습니다."
+                : finalStatus.error)
+        }
+        return finalStatus.loaded
+            ? .failed("caffeinate 서비스가 종료되지 않았습니다.")
+            : .ok
+    }
+
+    private func failureMessage(_ primary: String, rollback: String?) -> String {
+        guard let rollback else { return primary }
+        return "\(primary) 이전 상태 복구도 완료하지 못했습니다: \(rollback)"
+    }
+
+    /// 적용 중 실패했을 때 변경 전의 두 상태로 되돌린다.
+    private func restoreProtectionState(_ original: ProtectionState) -> String? {
+        var errors: [String] = []
+        let current = readProtectionState()
+
+        if current.screenSleepBlocked != original.screenSleepBlocked {
+            let result = original.screenSleepBlocked
+                ? startCaffeinateAgent()
+                : stopCaffeinateAgent()
+            if case .failed(let message) = result { errors.append(message) }
+        } else if !original.screenSleepBlocked, isCaffeinateAgentConfigured() {
+            if case .failed(let message) = stopCaffeinateAgent() { errors.append(message) }
+        }
+
+        if readSleepDisabled() != original.lidSleepBlocked {
+            if case .failed(let message) = applySleepDisabled(original.lidSleepBlocked) {
+                errors.append(message)
+            }
+        }
+
+        let restored = readProtectionState()
+        if !restored.screenStateKnown
+            || restored.screenSleepBlocked != original.screenSleepBlocked
+            || restored.lidSleepBlocked != original.lidSleepBlocked {
+            errors.append("실제 절전 차단 상태가 변경 전 값과 다릅니다.")
+        }
+        return errors.isEmpty ? nil : errors.joined(separator: " ")
+    }
+
+    /// 화면 자동 꺼짐 차단과 덮개 닫힘 차단을 함께 적용한다.
+    private func applyProtection(_ want: Bool) -> ApplyResult {
+        let original = readProtectionState()
+        guard original.screenStateKnown else {
+            return .failed("현재 caffeinate 상태를 확인하지 못해 설정을 바꾸지 않았습니다.")
+        }
+
+        if want {
+            if !original.lidSleepBlocked {
+                switch applySleepDisabled(true) {
+                case .ok:
+                    break
+                case .failed(let message):
+                    return .failed(failureMessage(message, rollback: restoreProtectionState(original)))
+                }
+            }
+
+            switch startCaffeinateAgent() {
+            case .ok:
+                if readProtectionState().isFullyEnabled { return .ok }
+                let message = "두 절전 차단 상태를 모두 확인하지 못했습니다."
+                return .failed(failureMessage(message, rollback: restoreProtectionState(original)))
+            case .failed(let message):
+                return .failed(failureMessage(message, rollback: restoreProtectionState(original)))
+            }
+        }
+
+        if original.lidSleepBlocked {
+            switch applySleepDisabled(false) {
+            case .ok:
+                break
+            case .failed(let message):
+                return .failed(failureMessage(message, rollback: restoreProtectionState(original)))
+            }
+        }
+
+        switch stopCaffeinateAgent() {
+        case .ok:
+            if readProtectionState().isFullyDisabled { return .ok }
+            let message = "두 절전 차단 상태가 모두 해제됐는지 확인하지 못했습니다."
+            return .failed(failureMessage(message, rollback: restoreProtectionState(original)))
+        case .failed(let message):
+            return .failed(failureMessage(message, rollback: restoreProtectionState(original)))
+        }
     }
 
     @objc private func toggleReleaseOnQuit() {

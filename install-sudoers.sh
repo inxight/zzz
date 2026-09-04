@@ -54,11 +54,12 @@ echo "==> 전체 sudoers 재검증"
 visudo -c
 
 echo
-echo "==> 무암호 동작 확인 ($TARGET_USER 로 실행)"
-if sudo -u "$TARGET_USER" sudo -n /usr/bin/pmset -a disablesleep 0 2>/dev/null; then
-  echo "    OK — 비밀번호 없이 실행됩니다."
+echo "==> 무암호 권한 확인 ($TARGET_USER 기준, 설정값은 변경하지 않음)"
+if sudo -u "$TARGET_USER" sudo -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 \
+  && sudo -u "$TARGET_USER" sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
+  echo "    OK — 켜기와 끄기 명령이 모두 비밀번호 없이 허용됩니다."
 else
-  echo "    실패 — 여전히 비밀번호를 요구합니다." >&2
+  echo "    실패 — 무암호 권한을 확인하지 못했습니다." >&2
   exit 1
 fi
 
